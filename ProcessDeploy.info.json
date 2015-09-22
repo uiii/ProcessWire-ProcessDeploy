@@ -1,0 +1,25 @@
+{
+	"title": "Deployment",
+	"version": 1,
+	"author": "Richard Jedlička",
+	"summary": "Push changes to (or pull changes from) the remote destination.",
+	"icon": "cloud-upload",
+	"singular": true,
+	"autoload": false,
+	"permission": "deploy",
+	"permissions": {
+		"deploy": "Manage deployment"
+	},
+	"page": {
+		"name": "deployment",
+		"parent": "setup",
+		"title": "Deployment"
+	},
+	"nav": [
+		{
+			"url": "add",
+			"label": "Add new destination",
+			"icon": "plus-circle"
+		}
+	]
+}

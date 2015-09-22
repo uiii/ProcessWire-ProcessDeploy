@@ -1,0 +1,484 @@
+<?php
+
+use ProcessDeploy\Connection\Local;
+use ProcessDeploy\Connection\SSH;
+use ProcessDeploy\Destination;
+use ProcessDeploy\DestinationFactory;
+use ProcessDeploy\Diff;
+
+set_include_path(get_include_path() . PATH_SEPARATOR . __DIR__ . '/vendor/phpseclib');
+
+/**
+ * Description of ProcessDeploy
+ */
+class ProcessDeploy extends Process
+{
+	const CLASS_PATH = __DIR__ . '/ProcessDeploy/';
+	const SCRIPT_PATH = __DIR__ . '/script/';
+
+	const DESTINATION_TABLE = 'deployment_destination';
+	const REMOTE_TABLE = 'deployment_remote_table';
+
+	protected $connectionTypes = array(
+		'ssh' => 'SSH',
+		'local' => 'Local'
+	);
+
+	/**
+	 * @var DestinationFactory
+	 */
+	protected $destinationFactory;
+
+	/**
+	 * @var Destination
+	 */
+	protected $localDestination;
+
+	public function init()
+	{
+		parent::init();
+
+		spl_autoload_register(function($classname) {
+			$classname = ltrim($classname, '\\');
+			$filename = sprintf('%s/%s.php', __DIR__, str_replace('\\', DIRECTORY_SEPARATOR, $classname));
+
+			if (is_file($filename)) {
+				require_once $filename;
+			}
+		});
+	}
+
+	public function ___install()
+	{
+		parent::___install();
+
+		$sql = 	'CREATE TABLE ' . self::DESTINATION_TABLE . ' (' .
+			'`id` int unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, ' .
+			'`title` varchar(255) NOT NULL,' .
+			'`host` varchar(2048) NOT NULL, ' .
+			'`connection_options` text ' .
+			')';
+		try {
+			if($this->database) {
+				$this->database->exec($sql);
+			} else {
+				$this->db->query($sql);
+			}
+		} catch(Exception $e) {
+			$this->error($e->getMessage());
+		}
+	}
+
+	public function ___uninstall()
+	{
+		parent::___uninstall();
+
+		$sql = 'DROP TABLE ' . self::DESTINATION_TABLE;
+
+		try {
+			if($this->database) {
+				$this->database->exec($sql);
+			} else {
+				$this->db->query($sql);
+			}
+		} catch(Exception $e) {
+			$this->error($e->getMessage());
+		}
+	}
+
+	public function ___execute()
+	{
+		$out = '';
+		$numFiles = 0;
+		$user = $this->wire('user');
+
+		$table = $this->modules->get('MarkupAdminDataTable');
+		$table->setEncodeEntities(false);
+		$table->headerRow(array(
+			$this->_x('title', 'th'),
+			$this->_x('host', 'th'),
+		));
+
+		$sql = 'SELECT id, title, host FROM ' . self::DESTINATION_TABLE;
+		$query = $this->database->prepare($sql);
+		$query->execute();
+
+		$numRows = 0;
+		while($row = $query->fetch(PDO::FETCH_NUM)) {
+			list($id, $title, $host) = $row;
+
+			$table->row(array(
+				$title => $this->page->url . 'edit?id=' . $id,
+				$host,
+			));
+
+			$numRows++;
+		}
+
+		if(! $numRows) {
+			$this->message($this->_('There are no deployment destinations.'));
+			$out .= '<br />';
+		} else {
+			$out .= $table->render();
+		}
+
+		$field = $this->modules->get('InputfieldButton');
+		$field->value = $this->_('New destination');
+		$field->icon = 'cloud-upload';
+		$field->href = $this->page->url . 'add';
+		$field->addClass('head_button_clone');
+		$out .= $field->render();
+
+		return $out;
+	}
+
+	public function ___executeAdd()
+	{
+		return $this->executeEdit();
+	}
+
+	public function ___executeEdit()
+	{
+		$id = (int) $this->input->get->id;
+		$destination = $this->loadDestination($id);
+
+		$this->wire('processHeadline', $destination ? 'Destination: ' . $destination->getTitle() : 'Add New Destination');
+		$this->wire('processBrowserTitle', $destination ? 'Edit Deployment Destination' : 'Add Deployment Destination');
+
+		$form = $this->buildEditForm($destination);
+
+		if ($this->input->post->submit) {
+			$form->processInput($this->input->post);
+
+			if (! $form->getErrors()) {
+				$connectionForm = $form->get('connection');
+
+				$connectionOptions = array(
+					'type' => $connectionForm->get('connection_type')->value
+				);
+
+				$connectionPrefix = $connectionOptions['type'] . '_';
+
+				foreach($connectionForm->find('name^=' . $connectionPrefix) as $field) {
+					$optionName = str_replace($connectionPrefix, '', $field->attr('name'));
+					$connectionOptions[$optionName] = $field->value;
+				}
+
+				$destination = $this->getDestinationFactory()->create(array(
+					'title' => $this->input->post->title,
+					'connection' => $connectionOptions
+				));
+
+				$sql = sprintf(
+					$destination->getId()
+						? 'UPDATE %s SET %s WHERE id = :id'
+						: 'INSERT %s SET %s',
+					self::DESTINATION_TABLE,
+					'`title` = :title, `host` = :host, `connection_options` = :connection_options'
+				);
+
+				$query = $this->database->prepare($sql);
+				$result = $query->execute(array(
+					'title' => $destination->getTitle(),
+					'host' => $destination->getConnection()->getHost(),
+					'connection_options' => json_encode($connectionOptions)
+				));
+
+				if($result) {
+					$destinationId = $this->database->lastInsertId();
+
+					$this->message($this->_('Added deployment destination') . ' - ' . $destination->getTitle());
+
+					$this->session->redirect($this->page->url . 'edit/?id=' . $destinationId);
+				} else {
+					$this->error('Error saving');
+				}
+			}
+		}
+
+		return $form->render();
+	}
+
+	public function ___executeDeploy()
+	{
+		chdir($this->config->paths->root);
+
+		$id = (int) $this->input->get->id;
+		$destination = $this->loadDestination($id);
+
+		$out = '';
+
+		$diff = new Diff($this->getLocalDestination(), $destination);
+		$tableDiffs = $diff->getTableDiffs();
+
+		foreach ($tableDiffs as $tableDiff) {
+			$out .= '<h2>' . strtoupper($tableDiff->getTable()) . '</h2>';
+
+			$errors = $tableDiff->getErrors();
+			if ($errors) {
+				$out .= implode('<br />', $errors);
+				continue;
+			}
+
+			$table = $this->modules->get('MarkupAdminDataTable');
+			$table->setEncodeEntities(false);
+			$table->headerRow(array(
+				$this->_x('name', 'th'),
+				$this->_x('local', 'th'),
+				$this->_x('remote', 'th'),
+				$this->_x('action on remote', 'th'),
+			));
+
+			foreach($tableDiff->getRecordDiffs() as $record) {
+				$table->row(array(
+					$record['name'][0] ?: $record['name'][1],
+					$record['name'][0] ? '<i class="fa fa-check state-green"></i>' : '<i class="fa fa-times state-red"></i>',
+					$record['name'][1] ? '<i class="fa fa-check state-green"></i>' : '<i class="fa fa-times state-red"></i>',
+					'<select></select>'
+				));
+			}
+
+			$out .= $table->render();
+		}
+
+		return $out;
+	}
+
+	protected function ___buildEditForm($destination)
+	{
+		$this->modules->get('JqueryWireTabs');
+
+		$form = $this->modules->get('InputfieldForm');
+		$form->attr('id+name', 'ProcessDeployEdit');
+		$form->attr('action', $this->page->url . 'edit' . ($destination ? '?id=' . $destination->getId() : ''));
+		$form->attr('method', 'post');
+
+		if ($destination) {
+			$form->add($this->buildDeployForm($destination));
+		}
+
+		$form->add($this->buildEditDetailsForm($destination));
+
+		if ($destination) {
+			$form->add($this->buildDeleteForm($destination));
+		}
+
+		$field = $this->modules->get('InputfieldSubmit');
+		$field->attr('name', 'submit');
+		$field->attr('value', $this->_('Save'));
+		$form->add($field);
+
+		return $form;
+	}
+
+	/**
+	 * @param Destination $destination
+	 */
+	protected function ___buildDeployForm(Destination $destination)
+	{
+		$form = new InputfieldWrapper();
+		$form->attr('id', 'deploy');
+		$form->attr('title', $this->_x('Deploy', 'tab'));
+		$form->attr('class', 'WireTab');
+
+		$field = $this->modules->get('InputfieldButton');
+		$field->attr('value', $this->_('Push'));
+		$field->attr('name', 'push');
+		$field->icon = 'cloud-upload';
+		$field->href = $this->page->url . 'deploy?id=' . $destination->getId();
+		$field->addClass('head_button_clone');
+		$form->add($field);
+
+		return $form;
+	}
+
+	/**
+	 * @param Destination $destination
+	 */
+	protected function ___buildEditDetailsForm(Destination $destination = null)
+	{
+		$form = new InputfieldWrapper();
+		$form->attr('id', 'details');
+		$form->attr('title', $this->_x('Details', 'tab'));
+		$form->attr('class', 'WireTab');
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'title');
+		$field->required = true;
+		$field->label = $this->_('Title');
+		$form->add($field);
+
+		$fieldset = $this->modules->get('InputfieldFieldset');
+		$fieldset->attr('name', 'connection');
+		$fieldset->label = $this->_('Connection');
+
+		$field = $this->modules->get('InputfieldRadios');
+		$field->attr('name', 'connection_type');
+		foreach($this->connectionTypes as $key => $title) {
+			$field->addOption($key, $title);
+		}
+		reset($this->connectionTypes);
+		$field->attr('value', key($this->connectionTypes));
+		$field->label = $this->_('Type');
+		$field->optionColumns = 1;
+		$fieldset->add($field);
+
+		if ($destination) {
+			$form->get('title')->attr('value', $destination->getTitle());
+			$fieldset->get('connection_type')->attr('value', $destination->getConnection()->getType());
+		}
+
+		$fieldset->add($this->buildEditSSHConnectionForm($destination));
+		$fieldset->add($this->buildEditLocalConnectionForm($destination));
+
+		$form->add($fieldset);
+
+		return $form;
+	}
+
+	protected function ___buildEditSSHConnectionForm(Destination $destination = null)
+	{
+		$form = new InputfieldWrapper;
+		$form->showIf = "connection_type=ssh";
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'ssh_host');
+		$field->required = true;
+		$field->label = $this->_('Host');
+		$field->columnWidth = 80;
+		$form->add($field);
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'ssh_port');
+		$field->label = $this->_('Port');
+		$field->columnWidth = 20;
+		$form->add($field);
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'ssh_pw_path');
+		$field->required = true;
+		$field->label = $this->_('Site path');
+		$field->description = $this->_('Absolute path to the ProcessWire site\'s root directory located on the traget machine.');
+		$form->add($field);
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'ssh_username');
+		$field->required = true;
+		$field->label = $this->_('Username');
+		$field->description = $this->_('Username of user who has permissions to read all the site\'s files.');
+		$field->columnWidth = 50;
+		$form->add($field);
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('type', 'password');
+		$field->attr('name', 'ssh_password');
+		$field->label = $this->_('Password');
+		$field->description = $this->_('Leave blank if no password is used or you want to be prompted.');
+		$form->add($field);
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'ssh_private_key_path');
+		$field->label = $this->_('Private key');
+		$field->description = $this->_('Absolute path to the private key. Leave blank if no key is used.');
+		$form->add($field);
+
+		if ($destination && $destination->getConnection() instanceof SSH) {
+			$connection = $destination->getConnection();
+			$form->get('ssh_host')->attr('value', $connection->getOption('host'));
+			$form->get('ssh_port')->attr('value', $connection->getOption('port'));
+			$form->get('ssh_pw_path')->attr('value', $connection->getOption('pw_path'));
+			$form->get('ssh_username')->attr('value', $connection->getOption('username'));
+			$form->get('ssh_password')->attr('value', $connection->getOption('password'));
+			$form->get('ssh_private_key_path')->attr('value', $connection->getOption('private_key_path'));
+		}
+
+		return $form;
+	}
+
+	protected function ___buildEditLocalConnectionForm(Destination $destination = null)
+	{
+		$form = new InputfieldWrapper;
+		$form->showIf = "connection_type=local";
+
+		$field = $this->modules->get('InputfieldText');
+		$field->attr('name', 'local_pw_path');
+		$field->required = true;
+		$field->label = $this->_('Site path');
+		$field->description = $this->_('Absolute path to the target ProcessWire site\'s root directory.');
+		$form->add($field);
+
+		if ($destination && $destination->getConnection() instanceof Local) {
+			$connection = $destination->getConnection();
+			$form->get('local_pw_path')->attr('value', $connection->getOption('pw_path'));
+		}
+
+		return $form;
+	}
+
+	/**
+	 * @param Destination $destination
+	 * @return InputfieldWrapper
+	 */
+	protected function ___buildDeleteForm(Destination $destination)
+	{
+		$form = new InputfieldWrapper();
+		$form->attr('id', 'delete');
+		$form->attr('class', 'WireTab');
+		$form->attr('title', $this->_x('Delete', 'tab'));
+
+		$field = $this->modules->get('InputfieldCheckbox');
+		$field->label = $this->_('Delete destination');
+		$field->icon = 'times-circle';
+		$field->attr('id+name', "delete");
+		$field->attr('value', $destination->getId());
+		$field->description = $this->_('Check the box and submit the form to permanently delete this deployment destination.');
+
+		$form->add($field);
+
+		return $form;
+	}
+
+	protected function getDestinationFactory()
+	{
+		if (! $this->destinationFactory) {
+			$this->destinationFactory = new DestinationFactory($this->database, $this->config);
+		}
+
+		return $this->destinationFactory;
+	}
+
+	public function getLocalDestination()
+	{
+		if (! $this->localDestination) {
+			$this->localDestination = $this->getDestinationFactory()->create(array(
+				'id' => null,
+				'title' => '__local__',
+				'connection' => array( 'type' => 'local' )
+			));
+		}
+
+		return $this->localDestination;
+	}
+
+	protected function loadDestination($id)
+	{
+		if($id) {
+			$query = $this->database->prepare('SELECT * FROM ' . self::DESTINATION_TABLE . ' WHERE id = :id');
+			$query->bindValue(':id', $id);
+			$query->execute();
+
+			if(! $query->rowCount()) throw new WireException('Unknown ID');
+
+			$row = $query->fetch();
+			$connectionOptions = json_decode($row['connection_options'], true);
+
+			return $this->getDestinationFactory()->create(array(
+				'id' => $row['id'],
+				'title' => $row['title'],
+				'connection' => $connectionOptions
+			));
+		}
+
+		return null;
+	}
+}
